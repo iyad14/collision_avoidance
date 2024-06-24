@@ -1,0 +1,12 @@
+/depth_image:
+  reliability: system_default
+  durability: system_default
+  depth: 5
+  history: keep_all
+
+/rgb_image:
+  reliability: system_default
+  durability: system_default
+  depth: 5
+  history: keep_all
+
