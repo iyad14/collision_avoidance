@@ -9,12 +9,12 @@ CollisionAvoidance::CollisionAvoidance(const rclcpp::NodeOptions& options)
     this->declare_parameter("fov_vertical", 0.52f);
 
     // Cropbox Parameters
-    this->declare_parameter("cropbox_min_x", -2.0);
-    this->declare_parameter("cropbox_min_y", 0.0);
+    this->declare_parameter("cropbox_min_x", 0.0);
+    this->declare_parameter("cropbox_min_y", -2.0);
     this->declare_parameter("cropbox_min_z", 0.03);
-    this->declare_parameter("cropbox_max_x", 2.0);
-    this->declare_parameter("cropbox_max_y", 6.0);
-    this->declare_parameter("cropbox_max_z", 1.5);
+    this->declare_parameter("cropbox_max_x", 7.0);
+    this->declare_parameter("cropbox_max_y", 2.0);
+    this->declare_parameter("cropbox_max_z", 2.5);
 
     // FlatScan Parameters
     this->declare_parameter("angle_min_deg", -29.0f);
@@ -104,13 +104,23 @@ CollisionAvoidance::CollisionAvoidance(const rclcpp::NodeOptions& options)
 }
 
 void CollisionAvoidance::start() {
+    // Checks for CUDA capable devices
+    int gpu_count = 0;
+    cudaGetDeviceCount(&gpu_count);
+    // Checks if a CUDA capable GPU is available.
+    if (!gpu_count) {
+        RCLCPP_INFO(this->get_logger(), "3D Collision Avoidance is enabled but couldn't find appropriate GPU");
+        return;
+    }
+
     // Initialize TF listener
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     // Initialize publishers
     point_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("point_cloud", 10);
-     
+    laser_scan_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("laser_scan", 10);
+
     // Initialize subscriptions
     camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         depth_camera_info_topic_, 1,
@@ -125,60 +135,87 @@ void CollisionAvoidance::start() {
                 depth_image_topic_, 10, 
                 [this](const sensor_msgs::msg::Image::SharedPtr msg) {
                     depth_image_msg_ = msg;
+                    // Handle depth image
+                    try {
+                        // Convert ROS Image message to OpenCV image
+                        depth_img_ptr_ = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
+
+                        // Check if image is valid
+                        if (depth_img_ptr_->image.empty()) {
+                            RCLCPP_WARN(this->get_logger(), "Received empty depth image");
+                            return;
+                        }
+                    } catch (cv_bridge::Exception & e) {
+                        RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+                        return;
+                    }
                     tick();
             });
         });
 }
 void CollisionAvoidance::tick() {
-    getDepthImage(depth_image_msg_, depth_img_ptr_);
     if (depth_img_ptr_) {
         // Convert depth image to point cloud
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
         convertDepthImageToPointCloud(depth_img_ptr_->image, cloud);
 
-        detectClustersWithLables(cloud);
         // Publish point cloud
-        // sensor_msgs::msg::PointCloud2 output;
-        // pcl::toROSMsg(*cloud, output);
-        // output.header = depth_image_msg_->header;
-        // output.header.frame_id = depth_camera_ref_frame_;
-        // point_cloud_pub_->publish(output);
+        sensor_msgs::msg::PointCloud2 output;
+        pcl::toROSMsg(*cloud, output);
+        output.header = depth_image_msg_->header;
+        output.header.frame_id = "base_link";
+        point_cloud_pub_->publish(output);
+
+        // Checks if cloud is empty.
+        if (cloud->size() == 0) {
+            return;
+        }
+
+        // Initialize the output laser for navigation.
+        initializeLaserScan(current_laser_scan_);
+        // initializeLaserScan(current_laser_scan_shield_);
+
+        // Initialize beam original heights vector.
+        // std::vector<float> flatscan_heights(laser_metadata.beam_count, 0.0);
+
+        // Initialize the output laser for flatscan fusion for the shield.
+        // auto laser_shield = std::make_shared<sensor_msgs::msg::LaserScan>();
+        // flatscanMetadata laser_shield_metadata = buildScanMeta(true);
+        // initializeLaserScan(*laser_shield, laser_shield_metadata.min_angle,
+        //     laser_shield_metadata.max_angle, laser_shield_metadata.range_min,
+        //     laser_shield_metadata.range_max, laser_shield_metadata.beam_count);
+        
+        // Extract the clusters with their metadata
+        kf::Matrix<Eigen::Dynamic, 2> obs;
+        std::vector<bool> camera_only_detections;
+        std::vector<std::vector<int>> clusters_scan;
+
+        int number_clusters = detectClustersWithLables(cloud, obs, camera_only_detections, clusters_scan);
+        // Initialize states
+        // std::vector<bool> states(number_clusters, false);
     }
 }
 void CollisionAvoidance::getIntrinsics(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info_msg) {
     // Handle camera info
     // depth_camera_ref_frame_ = msg->header.frame_id;
 
-    fx_ = camera_info_msg->k[0];
-    fy_ = camera_info_msg->k[4];
-    cx_ = camera_info_msg->k[2];
-    cy_ = camera_info_msg->k[5];
-
-    // RCLCPP_INFO(this->get_logger(), "Frame ID: %s", depth_camera_ref_frame_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Received depth intrinsics: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f", fx_, fy_, cx_, cy_);
+    /// Extract camera intrinsics
+    camera_focal_ = Eigen::Vector2f(camera_info_msg->k.at(4), camera_info_msg->k.at(0));
+    camera_center_ = Eigen::Vector2f(camera_info_msg->k.at(5),
+                                    camera_info_msg->k.at(2)); // 2, 5
+    camera_dimensions_ = std::make_pair(camera_info_msg->height, camera_info_msg->width);
 }
 void CollisionAvoidance::getRobotDescription() {
     while (true) {
         try {
-            geometry_msgs::msg::TransformStamped depth_transform_stamped = tf_buffer_->lookupTransform(base_link_ref_frame_, depth_camera_ref_frame_, tf2::TimePointZero);
-                    
-            depth_camera_T_base_link = tf2::transformToEigen(depth_transform_stamped.transform).matrix();
+            geometry_msgs::msg::TransformStamped depth_transform_stamped = tf_buffer_->lookupTransform(base_link_ref_frame_, depth_camera_ref_frame_, tf2::TimePointZero);        
+            depth_camera_T_base_link_ = toEigenAffine(depth_transform_stamped);
+            std::cout << "depth_camera_T_base_link_\n" << depth_camera_T_base_link_.matrix() << std::endl;
+            std::cout << depth_camera_T_base_link_.translation() << std::endl;
             
-            // Print depth_camera_T_base_link matrix
-            RCLCPP_INFO(this->get_logger(), "Depth Camera to Base Link Transform Matrix:");
-            RCLCPP_INFO(this->get_logger(), "%.3f %.3f %.3f %.3f",
-                        depth_camera_T_base_link(0, 0), depth_camera_T_base_link(0, 1),
-                        depth_camera_T_base_link(0, 2), depth_camera_T_base_link(0, 3));
-            RCLCPP_INFO(this->get_logger(), "%.3f %.3f %.3f %.3f",
-                        depth_camera_T_base_link(1, 0), depth_camera_T_base_link(1, 1),
-                        depth_camera_T_base_link(1, 2), depth_camera_T_base_link(1, 3));
-            RCLCPP_INFO(this->get_logger(), "%.3f %.3f %.3f %.3f",
-                        depth_camera_T_base_link(2, 0), depth_camera_T_base_link(2, 1),
-                        depth_camera_T_base_link(2, 2), depth_camera_T_base_link(2, 3));
-            RCLCPP_INFO(this->get_logger(), "%.3f %.3f %.3f %.3f",
-                        depth_camera_T_base_link(3, 0), depth_camera_T_base_link(3, 1),
-                        depth_camera_T_base_link(3, 2), depth_camera_T_base_link(3, 3));
-                
+            geometry_msgs::msg::TransformStamped lidar_transform_stamped = tf_buffer_->lookupTransform(lidar_ref_frame_, base_link_ref_frame_,tf2::TimePointZero);    
+            lidar_T_base_link_ = toEigenAffine(lidar_transform_stamped);
+            
             break; // Exit the loop once the transform is found
         } catch (tf2::TransformException &ex) {
             RCLCPP_WARN(this->get_logger(), "Failed to lookup robot description from tf service: %s", ex.what());
@@ -186,57 +223,41 @@ void CollisionAvoidance::getRobotDescription() {
         }
     } 
 }
-void CollisionAvoidance::getDepthImage(const sensor_msgs::msg::Image::SharedPtr& depth_image_msg, cv_bridge::CvImagePtr& depth_img_ptr_) {
-    // Handle depth image
+void CollisionAvoidance::get_odom_enc_T_robot() {
     try {
-        // Convert ROS Image message to OpenCV image
-        depth_img_ptr_ = cv_bridge::toCvCopy(depth_image_msg, sensor_msgs::image_encodings::TYPE_32FC1);
-
-        // Check if image is valid
-        if (depth_img_ptr_->image.empty()) {
-            RCLCPP_WARN(this->get_logger(), "Received empty depth image");
-            return;
-        }
-    } catch (cv_bridge::Exception & e) {
-        RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
-        return;
+        geometry_msgs::msg::TransformStamped odom_transform_stamped = tf_buffer_->lookupTransform(odom_ref_frame_, base_link_ref_frame_,tf2::TimePointZero);         
+        odom_T_base_link_ = toEigenAffine(depth_transform_stamped)
+    } catch (tf2::TransformException &ex) {
+        RCLCPP_WARN(this->get_logger(), "Failed to lookup robot description from tf service: %s", ex.what());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Sleep before retrying
     }
-} 
+}
 void CollisionAvoidance::convertDepthImageToPointCloud(const cv::Mat &depth_image, pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud) {
-    double roll = M_PI/2.0 + std::atan2(depth_camera_T_base_link(2, 1), depth_camera_T_base_link(2, 2));
+    float angle_radians = 14.0 * M_PI / 180.0f;
+    Eigen::AngleAxisf rotation(angle_radians, Eigen::Vector3f::UnitY());
+    Eigen::Matrix3f rotation_matrix = rotation.toRotationMatrix();
 
     for (int row = 0; row < depth_image.rows; row += 2) {
         for (int col = 0; col < depth_image.cols; col += 2) {
-            float depth_value = depth_image.at<float>(row, col);
+            // Compute the 3D location of the pixel and write to pointcloud
+            const float depth = depth_image.at<float>(row, col);
+            const Eigen::Vector2f pixel = {row, col};
+            const Eigen::Vector2f a = ((pixel - camera_center_).array() / camera_focal_.array()) * depth;
+            const Eigen::Vector3f p_camera = {a[1], a[0], depth};
 
-            // Calculate x, y, z coordinates from depth image
-            double u = col - cx_;
-            double v = row - cy_;
+            Eigen::Vector3f p_robot = depth_camera_T_base_link_ * p_camera - depth_camera_T_base_link_.translation();
+            p_robot = rotation_matrix * p_robot;
+            // Filter out points based on the bounding box criteria
+            if (p_robot[0] > cropbox_min_x_ && p_robot[1] > cropbox_min_y_ && p_robot[2] > cropbox_min_z_ &&
+                p_robot[0] < cropbox_max_x_ && p_robot[1] < cropbox_max_y_ && p_robot[2] < cropbox_max_z_) {
 
-            // Convert pixel (r, c) to 3D point in camera coordinates
-            double x = (u * depth_value) / fx_;
-            double y = depth_value;
-            double z = (-v * depth_value) / fy_; 
-
-            // Apply rotation
-            double temp_y = y * cos(roll) + z * sin(roll);
-            z = -y * sin(roll) + z * cos(roll);
-            y = temp_y;
-
-            // Filter out points above and below ground level
-            if (x > cropbox_min_x_ && y > cropbox_min_y_ && z > cropbox_min_z_ &&
-                x < cropbox_max_x_ && y < cropbox_max_y_ && z < cropbox_max_z_) {
                 // Add point to point cloud
-                pcl::PointXYZ point;
-                point.x = x;
-                point.y = y;
-                point.z = z;
-                cloud->points.push_back(point);
+                cloud->points.push_back(pcl::PointXYZ(p_robot[0], p_robot[1], p_robot[2]));
             }
         }
     }
 }
-void CollisionAvoidance::detectClustersWithLables(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
+int CollisionAvoidance::detectClustersWithLables(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, kf::Matrix<Eigen::Dynamic, 2> obs, std::vector<bool> camera_only_detections, std::vector<std::vector<int>> clusters_scan) {    
     // CUDA memory allocations for clusterer.
     cudaStream_t stream = NULL;
     cudaStreamCreate(&stream);
@@ -274,23 +295,164 @@ void CollisionAvoidance::detectClustersWithLables(pcl::PointCloud<pcl::PointXYZ>
     cudaExtractCluster cudaec(stream);
     cudaec.set(ecp);
 
+    // Supress output
     std::cout.setstate(std::ios_base::failbit);
     cudaec.extract(inputEC, sizeEC, outputEC, indexEC);
     std::cout.clear();
     cudaStreamSynchronize(stream);
 
-    // world_T_robot = get_world_T_robot(getTickTime());
-    // odom_enc_T_robot_current = get_odom_enc_T_robot(getTickTime());
-    // isaac::Pose3d world_T_robot = robot_T_odom_enc * odom_enc_T_robot;
+    // Stores transformation in odom_T_base_link_
+    get_odom_enc_T_robot();
 
     int number_clusters = indexEC[0];
-    // obs = kf::Matrix<Eigen::Dynamic, 2>(number_clusters, 2);
-    // camera_only_detections.assign(beam_count, false);
+    obs = kf::Matrix<Eigen::Dynamic, 2>(number_clusters, 2);
+    camera_only_detections.assign(beam_count, false);
+
+    for (size_t i = 1, memoffset = 0; i <= indexEC[0]; memoffset += indexEC[i], ++i) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cluster_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        float centroid_x = 0.0, centroid_y = 0.0;
+        std::vector<int> cluster_scan_indices;
+
+        // Iterate over the points in a cluster
+        for (std::size_t k = 0; k < indexEC[i]; ++k) {  
+            size_t point_idx = memoffset + k;
+            pcl::PointXYZ point(read_pointxyz_buffer(outputEC, point_idx, 0),
+                read_pointxyz_buffer(outputEC, point_idx, 1),
+                read_pointxyz_buffer(outputEC, point_idx, 2));
+            
+            cluster_cloud->push_back(point);
+            centroid_x += point.x;
+            centroid_y += point.y;
+
+            if (point.z < lidar_threshold_) {
+                lidar_cloud->push_back(point);
+            }
+
+            // Convert to laserscan for navigation.
+            double range = hypot(point.x, point.y);
+            double angle = RadToDeg(atan2(point.y, point.x));
+            if (angle < angle_min_deg_ || angle > angle_max_deg_) {
+                continue;
+            }
+
+            // if (!checkPointInsideFOV(point.x, point.z)) continue;
+            int index = (angle - angle_min_deg_) / angle_increment_;
+            if(current_laser_scan_.ranges[index] == 0 || range < current_laser_scan_.ranges[index]) {
+                current_laser_scan_.ranges[index] = range;
+                current_laser_scan_.intensities[index] = 50.0;
+                cluster_scan_indices.push_back(index);
+            }
+
+            // Convert to laserscan for flatscan merger for the shield.
+            // const Eigen::Vector3f p_robot = {point.x, point.y, point.z};
+            // const Eigen::Vector3f p_lidar = lidar_T_base_link_ * p_robot;
+            // double range_shield = hypot(p_lidar[0], p_lidar[1]);
+            //       if (range_shield < range_min_merger_ || range_shield > range_max_merger_) {
+            //     continue;
+            // }
+            // double angle_shield = RadToDeg(atan2(p_lidar[1], p_lidar[0]));
+            // std::cout << "Angle: " << angle_shield << std::endl;
+            // if (angle_shield < angle_min_merger_deg_ || angle_shield > angle_max_merger_deg_) {
+            //     continue;
+            // }
+            
+            // int index_shield = (angle_shield - angle_min_merger_deg_) / angle_increment_merger_;
+            // std::cout << "Index " << index_shield << std::endl;
+            // if(current_laser_scan_shield_.ranges[index_shield] == 0 || range_shield < current_laser_scan_shield_.ranges[index_shield]) {
+            //     current_laser_scan_shield_.ranges[index_shield] = range_shield - shield_distortion_;
+            //     current_laser_scan_shield_.intensities[index_shield] = 50.0;
+            // }
+        }
+
+        centroid_x /= indexEC[i];
+        centroid_y /= indexEC[i];
+
+        const Eigen::Vector3d centroid = {centroid_x, centroid_y, 0.0};
+        // Vector3d centroid_world = odom_enc_T_robot_current * centroid;
+        // obs(i - 1, 0) = centroid_world[0];
+        // obs(i - 1, 1) = centroid_world[1];
+
+    }
+
+    publishLaserScan(current_laser_scan_);
+
+    cudaFree(inputEC);
+    cudaFree(outputEC);
+    cudaFree(indexEC);
+    cudaStreamDestroy(stream);
+
+    return number_clusters;
+}
+bool CollisionAvoidance::checkPointInsideFOV(double x, double z) {
+    // if (z >= ((x)*get_fov_vertical()))
+    //   std::cout << "Detected out of fov on z:  " << z << " x:  " << x << std::endl;
+    double roll = std::atan2(depth_camera_T_base_link_(2, 1), depth_camera_T_base_link_(2, 2));
+    double pitch = std::asin(-depth_camera_T_base_link_(2, 0));
+    double yaw = std::atan2(depth_camera_T_base_link_(1, 0), depth_camera_T_base_link_(0, 0));
+    
+    std::cout << "Roll " << RadToDeg(roll) << " pitch " << RadToDeg(pitch) << " yaw " << RadToDeg(yaw) << std::endl;
+    double pitch_fov = 90 - RadToDeg(yaw) + 20;
+    std::cout << pitch_fov << std::endl;
+    double fov_vertical = tan(DegToRad(pitch_fov));
+    std::cout << "FOV angle:   " << fov_vertical << std::endl;
+    return (!(z >= ((x)*fov_vertical)));
+}
+flatscanMetadata CollisionAvoidance::buildScanMeta(bool is_merger) {
+  flatscanMetadata flatscanMeta;
+  if (is_merger) {
+    flatscanMeta.min_angle = DegToRad(angle_min_merger_deg_);
+    flatscanMeta.max_angle = DegToRad(angle_max_merger_deg_);
+    flatscanMeta.range_min = range_min_merger_;
+    flatscanMeta.range_max = range_max_merger_;
+    flatscanMeta.increment_angle = DegToRad(angle_increment_merger_);
+    flatscanMeta.beam_count =
+        std::ceil((flatscanMeta.max_angle - flatscanMeta.min_angle) / flatscanMeta.increment_angle);
+  } else {
+    flatscanMeta.min_angle = DegToRad(angle_min_deg_);
+    flatscanMeta.max_angle = DegToRad(angle_max_deg_);
+    flatscanMeta.increment_angle = DegToRad(angle_increment_);
+    flatscanMeta.range_min = range_min_;
+    flatscanMeta.range_max = range_max_;
+    flatscanMeta.beam_count =
+        std::ceil((flatscanMeta.max_angle - flatscanMeta.min_angle) / flatscanMeta.increment_angle);
+  }
+  return flatscanMeta;
+}
+void CollisionAvoidance::initializeLaserScan(LaserScan& scan) {
+    // Set laser scan parameters
+    scan.min_angle = DegToRad(angle_min_deg_);
+    scan.max_angle = DegToRad(angle_max_deg_);
+    scan.range_min = range_min_;
+    scan.range_max = range_max_;
+    scan.increment_angle = DegToRad(angle_increment_);
+
+    int beam_count = std::ceil((scan.max_angle - scan.min_angle) / current_laser_scan_.increment_angle);
+    // Initialize ranges and intensities with default values
+    current_laser_scan_.ranges.resize(beam_count, std::numeric_limits<float>::infinity());
+    current_laser_scan_.intensities.resize(beam_count, 0.0);
 }
 
-inline float read_pointxyz_buffer(float* buffer, size_t point_idx, size_t dim_idx) {
-  return buffer[point_idx * sizeof(pcl::PointXYZ) / sizeof(float) + dim_idx];
+void CollisionAvoidance::publishLaserScan(LaserScan& laserScan) {
+    sensor_msgs::msg::LaserScan msg;
+
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "base_link";
+
+    msg.angle_min = laserScan.min_angle;
+    msg.angle_max = laserScan.max_angle;
+    msg.angle_increment = laserScan.increment_angle;
+    msg.time_increment = 0.0; // Set as appropriate
+    msg.scan_time = 0.0; // Set as appropriate
+    msg.range_min = laserScan.range_min;
+    msg.range_max = laserScan.range_max;
+
+    msg.ranges = laserScan.ranges;
+    msg.intensities = laserScan.intensities;
+
+    laser_scan_pub_->publish(msg);
 }
+
 int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
     auto collision_avoidance_node = std::make_shared<CollisionAvoidance>(rclcpp::NodeOptions());
