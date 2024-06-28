@@ -10,4 +10,9 @@ struct LaserScan {
   
   std::vector<float> ranges;       
   std::vector<float> intensities;
+  std::vector<float> heights;
+  std::vector<bool> hanging;
+  std::vector<bool> states;
+  std::vector<bool> in_fov;
+  std::vector<bool> camera_only_detections;
 };
